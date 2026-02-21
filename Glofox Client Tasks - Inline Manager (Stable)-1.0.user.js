@@ -39,6 +39,8 @@
   const TASKS_PATH_RE = /^\/task-management-api\/v1\/locations\/([^/]+)\/tasks$/i;
   const TASK_ITEM_PATH_RE = /^\/task-management-api\/v1\/locations\/([^/]+)\/tasks\/([^/?#]+)$/i;
   const TASKS_TEST_ID_PREFIX = 'tasks-member-list-element-';
+  const CALENDAR_MONTH_NAMES_PL = ['styczen', 'luty', 'marzec', 'kwiecien', 'maj', 'czerwiec', 'lipiec', 'sierpien', 'wrzesien', 'pazdziernik', 'listopad', 'grudzien'];
+  const CALENDAR_DAY_NAMES_PL = ['Pon', 'Wt', 'Sr', 'Czw', 'Pt', 'Sob', 'Nie'];
 
   // Store trzyma lokalne nadpisania UI do czasu pełnego odświeżenia danych.
   const localOverrides = new Map();
@@ -53,6 +55,8 @@
   let inputName;
   let inputNotes;
   let inputDate;
+  let dateFieldWrapper;
+  let dateFieldError;
   let modalCancelBtn;
   let modalSaveBtn;
   let activeCtx = null;
@@ -65,6 +69,17 @@
   let apiRequestHeaders = {};
   let saveRequestHeaders = {};
   let saveMethodHint = 'PATCH';
+  const calendarState = {
+    open: false,
+    targetField: '',
+    month: 0,
+    year: 0,
+    error: '',
+    suppressBlurCommit: false,
+    anchorTop: 20,
+    anchorLeft: 20,
+  };
+  let calendarPopupEl = null;
 
   function init() {
     installNetworkInterceptors();
@@ -126,6 +141,12 @@
       }
       .gcti-field textarea { resize: vertical; min-height: 96px; }
       .gcti-invalid { border-color: #e14545 !important; }
+      .gcti-date-input { font-variant-numeric: tabular-nums; }
+      .gcti-date-error {
+        margin-top: 6px;
+        font-size: 12px;
+        color: #b4233f;
+      }
 
       .gcti-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
       .gcti-btn {
@@ -156,6 +177,85 @@
         pointer-events: none;
       }
       .gcti-toast.gcti-open { opacity: 1; transform: translateY(0); }
+
+      .gcti-cal {
+        position: fixed;
+        z-index: 1000001;
+        background: #fff;
+        border: 1px solid #d8dcf4;
+        border-radius: 10px;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
+        padding: 10px;
+        width: 280px;
+        display: none;
+      }
+      .gcti-cal.gcti-open { display: inline-block; }
+      .gcti-cal-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .gcti-cal-nav {
+        border: 1px solid #d6daf4;
+        background: #fff;
+        color: #2d3164;
+        border-radius: 6px;
+        min-width: 30px;
+        height: 28px;
+        cursor: pointer;
+      }
+      .gcti-cal-title {
+        font-size: 13px;
+        font-weight: 700;
+        color: #2b2f62;
+        text-transform: capitalize;
+      }
+      .gcti-cal-table { width: 100%; border-collapse: collapse; }
+      .gcti-cal-table th, .gcti-cal-table td {
+        text-align: center;
+        width: 14.28%;
+        height: 30px;
+        font-size: 12px;
+      }
+      .gcti-cal-table th { color: #596089; font-weight: 700; }
+      .gcti-cal-empty { color: transparent; }
+      .gcti-cal-day {
+        border: none;
+        background: #fff;
+        color: #2d3164;
+        border-radius: 6px;
+        cursor: pointer;
+        width: 28px;
+        height: 28px;
+      }
+      .gcti-cal-day:hover { background: #eef1ff; }
+      .gcti-cal-day.is-today { outline: 1px solid #b8bef8; }
+      .gcti-cal-day.is-selected { background: #5f63e9; color: #fff; }
+      .gcti-cal-actions {
+        margin-top: 8px;
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      .gcti-cal-today {
+        border: 1px solid #d6daf4;
+        background: #fff;
+        color: #2d3164;
+        border-radius: 6px;
+        height: 28px;
+        padding: 0 10px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .gcti-cal-today:hover { background: #eef1ff; }
+      .gcti-cal-error {
+        margin-top: 8px;
+        font-size: 12px;
+        color: #b4233f;
+      }
     `;
 
     document.head.appendChild(style);
@@ -186,9 +286,20 @@
     const notesField = createField(LABELS.notes, 'textarea');
     inputNotes = notesField.input;
 
-    const dateField = createField(LABELS.assignmentDate, 'date');
+    const dateField = createField(LABELS.assignmentDate, 'text');
+    dateFieldWrapper = dateField.wrapper;
     inputDate = dateField.input;
     inputDate.required = true;
+    inputDate.classList.add('gcti-date-input');
+    inputDate.setAttribute('inputmode', 'numeric');
+    inputDate.setAttribute('maxlength', '10');
+    inputDate.setAttribute('placeholder', 'DD-MM-RRRR');
+    inputDate.setAttribute('data-date-input', 'dueDateInput');
+
+    dateFieldError = document.createElement('div');
+    dateFieldError.className = 'gcti-date-error';
+    dateFieldError.style.display = 'none';
+    dateFieldWrapper.appendChild(dateFieldError);
 
     const actions = document.createElement('div');
     actions.className = 'gcti-actions';
@@ -215,6 +326,7 @@
     modal.appendChild(form);
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
+    ensureCalendarPopup();
 
     overlay.addEventListener('click', function (event) {
       if (event.target === overlay) closeModal();
@@ -223,6 +335,10 @@
     modalCancelBtn.addEventListener('click', closeModal);
 
     document.addEventListener('keydown', function (event) {
+      if (event.key === 'Escape' && calendarState.open) {
+        closeCalendar();
+        return;
+      }
       if (event.key === 'Escape' && overlay.classList.contains('gcti-open')) closeModal();
     });
 
@@ -230,6 +346,9 @@
       event.preventDefault();
       saveFromModal();
     });
+
+    bindDateInputEvents();
+    bindCalendarGlobalEvents();
   }
 
   function createField(labelText, kind) {
@@ -251,6 +370,331 @@
     wrapper.appendChild(input);
 
     return { wrapper, input };
+  }
+
+  function bindDateInputEvents() {
+    if (!inputDate) return;
+
+    inputDate.addEventListener('focus', function (event) {
+      openCalendarForDateInput(event.currentTarget);
+    });
+
+    inputDate.addEventListener('click', function () {
+      openCalendarForDateInput(inputDate);
+    });
+
+    inputDate.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') {
+        commitDateFieldText(event.target.value);
+        return;
+      }
+      if (event.key === 'Escape') {
+        closeCalendar();
+      }
+    });
+
+    inputDate.addEventListener('blur', function (event) {
+      if (calendarState.suppressBlurCommit) {
+        calendarState.suppressBlurCommit = false;
+        return;
+      }
+      commitDateFieldText(event.target.value);
+    });
+  }
+
+  function bindCalendarGlobalEvents() {
+    document.addEventListener('mousedown', function (event) {
+      if (!calendarState.open) return;
+      const target = event.target;
+      if (target === inputDate || (target && target.closest && target.closest('.gcti-cal'))) return;
+      closeCalendar();
+    });
+  }
+
+  function ensureCalendarPopup() {
+    if (calendarPopupEl) return;
+
+    calendarPopupEl = document.createElement('div');
+    calendarPopupEl.className = 'gcti-cal';
+    calendarPopupEl.addEventListener('mousedown', function () {
+      calendarState.suppressBlurCommit = true;
+    });
+    calendarPopupEl.addEventListener('click', onCalendarClick);
+    document.body.appendChild(calendarPopupEl);
+  }
+
+  function onCalendarClick(event) {
+    const actionEl = event.target && event.target.closest ? event.target.closest('[data-a]') : null;
+    if (!actionEl) return;
+
+    const action = actionEl.getAttribute('data-a');
+    if (!action) return;
+
+    if (action === 'cal-prev') {
+      onCalendarPrevMonth();
+      return;
+    }
+    if (action === 'cal-next') {
+      onCalendarNextMonth();
+      return;
+    }
+    if (action === 'cal-today') {
+      onCalendarToday();
+      return;
+    }
+    if (action === 'cal-clear') {
+      onCalendarClear();
+      return;
+    }
+    if (action === 'cal-day') {
+      const day = Number(actionEl.getAttribute('data-day')) || 0;
+      if (day > 0) onCalendarSelectDay(day);
+    }
+  }
+
+  function closeCalendar() {
+    calendarState.open = false;
+    calendarState.targetField = '';
+    calendarState.error = '';
+    calendarState.suppressBlurCommit = false;
+    hideDateError();
+    if (calendarPopupEl) {
+      calendarPopupEl.classList.remove('gcti-open');
+      calendarPopupEl.innerHTML = '';
+    }
+  }
+
+  function openCalendarForDateInput(anchorEl) {
+    if (!inputDate) return;
+    setCalendarAnchorFromElement(anchorEl);
+    const sameField = calendarState.open && calendarState.targetField === 'dueDateInput';
+    if (sameField) return;
+
+    setCalendarMonthFromIso(calendarFieldIsoValue());
+    calendarState.targetField = 'dueDateInput';
+    calendarState.open = true;
+    calendarState.error = '';
+    calendarState.suppressBlurCommit = false;
+    hideDateError();
+    renderCalendarPopup();
+  }
+
+  function calendarFieldIsoValue() {
+    if (!inputDate) return '';
+    return parseDmyToIso(inputDate.value);
+  }
+
+  function setCalendarMonthFromIso(iso) {
+    const match = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (match) {
+      calendarState.year = Number(match[1]);
+      calendarState.month = Number(match[2]) - 1;
+      return;
+    }
+    const now = new Date();
+    calendarState.year = now.getFullYear();
+    calendarState.month = now.getMonth();
+  }
+
+  function setCalendarAnchorFromElement(anchorEl) {
+    if (!(anchorEl instanceof HTMLElement)) return;
+    const rect = anchorEl.getBoundingClientRect();
+    const popupWidth = 280;
+    const popupHeight = 330;
+    const margin = 12;
+    let left = Math.round(rect.left);
+    let top = Math.round(rect.bottom + 6);
+    const maxLeft = Math.max(margin, window.innerWidth - popupWidth - margin);
+    const maxTop = Math.max(margin, window.innerHeight - popupHeight - margin);
+    if (left > maxLeft) left = maxLeft;
+    if (left < margin) left = margin;
+    if (top > maxTop) {
+      const above = Math.round(rect.top - popupHeight - 6);
+      top = above >= margin ? above : maxTop;
+    }
+    if (top < margin) top = margin;
+    calendarState.anchorLeft = left;
+    calendarState.anchorTop = top;
+  }
+
+  function calendarPopupStyle() {
+    const top = Number(calendarState.anchorTop);
+    const left = Number(calendarState.anchorLeft);
+    const safeTop = Number.isFinite(top) ? Math.max(8, top) : 20;
+    const safeLeft = Number.isFinite(left) ? Math.max(8, left) : 20;
+    return 'top:' + safeTop + 'px;left:' + safeLeft + 'px;';
+  }
+
+  function commitDateFieldText(rawText) {
+    const txt = String(rawText || '').trim();
+    if (!txt) {
+      calendarState.error = '';
+      hideDateError();
+      if (inputDate) {
+        inputDate.value = '';
+        inputDate.classList.remove('gcti-invalid');
+      }
+      return '';
+    }
+
+    const parsed = parseDmyToIso(txt);
+    if (!parsed) {
+      setDateError('Niepoprawny format daty. Uzyj DD-MM-RRRR.');
+      renderCalendarPopup();
+      return '';
+    }
+
+    calendarState.error = '';
+    hideDateError();
+    if (inputDate) {
+      inputDate.value = formatIsoToDmy(parsed);
+      inputDate.classList.remove('gcti-invalid');
+    }
+    return parsed;
+  }
+
+  function renderCalendarPopup() {
+    if (!calendarPopupEl) return;
+    if (!calendarState.open || !calendarState.targetField) {
+      calendarPopupEl.classList.remove('gcti-open');
+      calendarPopupEl.innerHTML = '';
+      return;
+    }
+
+    const cells = calendarGridData(calendarState.year, calendarState.month);
+    const today = new Date();
+    const selected = calendarSelectedParts();
+    const rows = [];
+
+    for (let rowIndex = 0; rowIndex < cells.length; rowIndex += 7) {
+      const chunk = cells.slice(rowIndex, rowIndex + 7);
+      const cols = chunk.map(function (day) {
+        if (!day) return '<td class="gcti-cal-empty">.</td>';
+
+        const isToday = today.getFullYear() === calendarState.year
+          && today.getMonth() === calendarState.month
+          && today.getDate() === day;
+        const isSelected = selected
+          && selected.year === calendarState.year
+          && selected.month === calendarState.month + 1
+          && selected.day === day;
+
+        const classes = ['gcti-cal-day', isToday ? 'is-today' : '', isSelected ? 'is-selected' : '']
+          .join(' ')
+          .trim();
+
+        return '<td><button class="' + classes + '" data-a="cal-day" data-day="' + day + '" type="button">' + day + '</button></td>';
+      }).join('');
+      rows.push('<tr>' + cols + '</tr>');
+    }
+
+    const title = CALENDAR_MONTH_NAMES_PL[calendarState.month] + ' ' + calendarState.year;
+    const errorHtml = calendarState.error ? '<div class="gcti-cal-error">' + escapeHtml(calendarState.error) + '</div>' : '';
+
+    calendarPopupEl.style.cssText = calendarPopupStyle();
+    calendarPopupEl.innerHTML = ''
+      + '<div class="gcti-cal-head">'
+      + '<button class="gcti-cal-nav" data-a="cal-prev" type="button">&lt;</button>'
+      + '<div class="gcti-cal-title">' + escapeHtml(title) + '</div>'
+      + '<button class="gcti-cal-nav" data-a="cal-next" type="button">&gt;</button>'
+      + '</div>'
+      + '<table class="gcti-cal-table">'
+      + '<thead><tr>' + CALENDAR_DAY_NAMES_PL.map(function (n) { return '<th>' + n + '</th>'; }).join('') + '</tr></thead>'
+      + '<tbody>' + rows.join('') + '</tbody>'
+      + '</table>'
+      + '<div class="gcti-cal-actions">'
+      + '<button class="gcti-cal-today" data-a="cal-clear" type="button">Wyczysc</button>'
+      + '<button class="gcti-cal-today" data-a="cal-today" type="button">Dzisiaj</button>'
+      + '</div>'
+      + errorHtml;
+
+    calendarPopupEl.classList.add('gcti-open');
+  }
+
+  function onCalendarPrevMonth() {
+    calendarState.month -= 1;
+    if (calendarState.month < 0) {
+      calendarState.month = 11;
+      calendarState.year -= 1;
+    }
+    renderCalendarPopup();
+  }
+
+  function onCalendarNextMonth() {
+    calendarState.month += 1;
+    if (calendarState.month > 11) {
+      calendarState.month = 0;
+      calendarState.year += 1;
+    }
+    renderCalendarPopup();
+  }
+
+  function onCalendarToday() {
+    const now = new Date();
+    calendarState.year = now.getFullYear();
+    calendarState.month = now.getMonth();
+    calendarState.error = '';
+    calendarState.suppressBlurCommit = false;
+    renderCalendarPopup();
+  }
+
+  function onCalendarClear() {
+    calendarState.error = '';
+    calendarState.suppressBlurCommit = false;
+    closeCalendar();
+    if (inputDate) {
+      inputDate.value = '';
+      inputDate.classList.remove('gcti-invalid');
+    }
+  }
+
+  function onCalendarSelectDay(day) {
+    if (!calendarState.open || !calendarState.targetField) return;
+    const iso = toIsoDateFromParts(day, calendarState.month + 1, calendarState.year);
+    if (!iso) return;
+    calendarState.error = '';
+    calendarState.suppressBlurCommit = false;
+    closeCalendar();
+    if (inputDate) {
+      inputDate.value = formatIsoToDmy(iso);
+      inputDate.classList.remove('gcti-invalid');
+    }
+  }
+
+  function calendarGridData(year, month) {
+    const firstDay = new Date(year, month, 1);
+    let firstWeekday = firstDay.getDay();
+    if (firstWeekday === 0) firstWeekday = 7;
+    const leading = firstWeekday - 1;
+    const totalDays = daysInMonth(year, month + 1);
+    const cells = [];
+    for (let i = 0; i < leading; i += 1) cells.push(0);
+    for (let d = 1; d <= totalDays; d += 1) cells.push(d);
+    while (cells.length % 7 !== 0) cells.push(0);
+    return cells;
+  }
+
+  function calendarSelectedParts() {
+    const iso = calendarFieldIsoValue();
+    const match = String(iso || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return null;
+    return {
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+    };
+  }
+
+  function setDateError(message) {
+    calendarState.error = String(message || '');
+    if (dateFieldError) {
+      dateFieldError.textContent = calendarState.error;
+      dateFieldError.style.display = calendarState.error ? 'block' : 'none';
+    }
+  }
+
+  function hideDateError() {
+    setDateError('');
   }
 
   function installNetworkInterceptors() {
@@ -694,7 +1138,7 @@
 
     inputName.value = task.title || '';
     inputNotes.value = task.notes || '';
-    inputDate.value = task.dueDate || '';
+    inputDate.value = formatIsoToDmy(task.dueDate || '');
 
     clearValidation();
     overlay.classList.add('gcti-open');
@@ -707,6 +1151,7 @@
   }
 
   function closeModal() {
+    closeCalendar();
     overlay.classList.remove('gcti-open');
     document.body.classList.remove('gcti-modal-open');
     activeCtx = null;
@@ -724,15 +1169,19 @@
 
     const title = inputName.value.trim();
     const notes = inputNotes.value.trim();
-    const dueDate = inputDate.value;
+    const dueDateText = inputDate.value;
+    const dueDateIso = commitDateFieldText(dueDateText);
 
     let invalid = false;
     if (!title) {
       inputName.classList.add('gcti-invalid');
       invalid = true;
     }
-    if (!dueDate) {
+    if (!dueDateIso) {
       inputDate.classList.add('gcti-invalid');
+      if (!dateFieldError || !dateFieldError.textContent) {
+        setDateError('Niepoprawny format daty. Uzyj DD-MM-RRRR.');
+      }
       invalid = true;
     }
     if (invalid) return;
@@ -742,7 +1191,7 @@
     const result = await saveTaskEdit(ctx, {
       title,
       notes,
-      dueDateIso: dueDate,
+      dueDateIso: dueDateIso,
     });
 
     setModalSaving(false);
@@ -756,7 +1205,7 @@
     const updated = mapApiTaskToModalData(finalTask, {
       title,
       notes,
-      dueDate,
+      dueDate: dueDateIso,
       taskType: ctx.parts.taskType || 'Zadanie - Do zrobienia',
     });
 
@@ -916,6 +1365,7 @@
   function clearValidation() {
     inputName.classList.remove('gcti-invalid');
     inputDate.classList.remove('gcti-invalid');
+    hideDateError();
   }
 
   function toast(message) {
@@ -965,6 +1415,58 @@
     return yyyy + '-' + mm + '-' + dd;
   }
 
+  function isLeapYear(year) {
+    if (year % 400 === 0) return true;
+    if (year % 100 === 0) return false;
+    return year % 4 === 0;
+  }
+
+  function daysInMonth(year, month) {
+    if (month === 2) return isLeapYear(year) ? 29 : 28;
+    if (month === 4 || month === 6 || month === 9 || month === 11) return 30;
+    return 31;
+  }
+
+  function toIsoDateFromParts(day, month, year) {
+    const d = Number(day);
+    const m = Number(month);
+    const y = Number(year);
+    if (!Number.isFinite(d) || !Number.isFinite(m) || !Number.isFinite(y)) return '';
+    if (y < 1900 || y > 2100) return '';
+    if (m < 1 || m > 12) return '';
+    const maxDay = daysInMonth(y, m);
+    if (d < 1 || d > maxDay) return '';
+    return String(y).padStart(4, '0') + '-' + String(m).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+  }
+
+  function parseDmyToIso(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (/^\d{8}$/.test(raw)) {
+      return toIsoDateFromParts(raw.slice(0, 2), raw.slice(2, 4), raw.slice(4, 8));
+    }
+    if (/^\d{2}-\d{2}-\d{4}$/.test(raw)) {
+      const parts = raw.split('-');
+      return toIsoDateFromParts(parts[0], parts[1], parts[2]);
+    }
+    return '';
+  }
+
+  function formatIsoToDmy(isoValue) {
+    const iso = String(isoValue || '').trim();
+    const match = iso.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return '';
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (!Number.isFinite(day) || !Number.isFinite(month) || !Number.isFinite(year)) return '';
+    if (year < 1900 || year > 2100) return '';
+    if (month < 1 || month > 12) return '';
+    const maxDay = daysInMonth(year, month);
+    if (day < 1 || day > maxDay) return '';
+    return String(day).padStart(2, '0') + '-' + String(month).padStart(2, '0') + '-' + String(year).padStart(4, '0');
+  }
+
   function fromIso(iso) {
     if (!iso || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso || '';
     const parts = iso.split('-');
@@ -997,6 +1499,15 @@
 
   function normalize(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function escapeHtml(value) {
+    return String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 
   function getFetchMethod(input, init) {
