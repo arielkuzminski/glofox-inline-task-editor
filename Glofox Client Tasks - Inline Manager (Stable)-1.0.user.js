@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Glofox Client Tasks - Inline Manager (Stable)
 // @namespace    https://glofox.com/
-// @version      1.1.0
-// @description  Dodaje przycisk Edytuj na kafelkach zadań klienta i otwiera modal do edycji (realny odczyt + mock zapisu)
+// @version      1.2.0
+// @description  Dodaje przycisk Edytuj na kafelkach zadań klienta i otwiera modal do edycji (realny odczyt + realny zapis)
 // @author       You
 // @match        *://*.glofox.com/*
 // @run-at       document-idle
@@ -28,14 +28,19 @@
     assignmentDate: 'Data przypisania zadania',
     cancel: 'Anuluj',
     save: 'Zapisz',
-    saved: 'Zapisano (mock)',
+    saving: 'Zapisywanie...',
+    saved: 'Zapisano',
+    saveFailed: 'Nie udało się zapisać zadania',
+    saveUnauthorized: 'Brak autoryzacji do zapisu zadania',
+    saveUnavailable: 'Brak kontekstu API do zapisu',
     fallbackDom: 'Użyto danych lokalnych (brak rekordu API)',
   };
 
   const TASKS_PATH_RE = /^\/task-management-api\/v1\/locations\/([^/]+)\/tasks$/i;
+  const TASK_ITEM_PATH_RE = /^\/task-management-api\/v1\/locations\/([^/]+)\/tasks\/([^/?#]+)$/i;
   const TASKS_TEST_ID_PREFIX = 'tasks-member-list-element-';
 
-  // Store trzyma WYŁĄCZNIE lokalne nadpisania z modala (mock zapisu).
+  // Store trzyma lokalne nadpisania UI do czasu pełnego odświeżenia danych.
   const localOverrides = new Map();
   const cardRuntimeIndex = new WeakMap();
 
@@ -48,6 +53,8 @@
   let inputName;
   let inputNotes;
   let inputDate;
+  let modalCancelBtn;
+  let modalSaveBtn;
   let activeCtx = null;
   let restoreFocusEl = null;
 
@@ -56,6 +63,8 @@
   let tasksFetchInFlight = null;
   let lastFetchError = null;
   let apiRequestHeaders = {};
+  let saveRequestHeaders = {};
+  let saveMethodHint = 'PATCH';
 
   function init() {
     installNetworkInterceptors();
@@ -184,18 +193,18 @@
     const actions = document.createElement('div');
     actions.className = 'gcti-actions';
 
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.className = 'gcti-btn gcti-btn-cancel';
-    cancelBtn.textContent = LABELS.cancel;
+    modalCancelBtn = document.createElement('button');
+    modalCancelBtn.type = 'button';
+    modalCancelBtn.className = 'gcti-btn gcti-btn-cancel';
+    modalCancelBtn.textContent = LABELS.cancel;
 
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'submit';
-    saveBtn.className = 'gcti-btn gcti-btn-save';
-    saveBtn.textContent = LABELS.save;
+    modalSaveBtn = document.createElement('button');
+    modalSaveBtn.type = 'submit';
+    modalSaveBtn.className = 'gcti-btn gcti-btn-save';
+    modalSaveBtn.textContent = LABELS.save;
 
-    actions.appendChild(cancelBtn);
-    actions.appendChild(saveBtn);
+    actions.appendChild(modalCancelBtn);
+    actions.appendChild(modalSaveBtn);
 
     form.appendChild(title);
     form.appendChild(nameField.wrapper);
@@ -211,7 +220,7 @@
       if (event.target === overlay) closeModal();
     });
 
-    cancelBtn.addEventListener('click', closeModal);
+    modalCancelBtn.addEventListener('click', closeModal);
 
     document.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && overlay.classList.contains('gcti-open')) closeModal();
@@ -257,26 +266,49 @@
     function patchedFetch(input, init) {
       const url = getFetchUrl(input);
       const method = getFetchMethod(input, init);
-      let parsed = null;
+      let parsedList = null;
+      let parsedItem = null;
 
       if (url) {
-        parsed = parseTaskApiContext(url);
-        if (parsed) {
-          applyApiContext(parsed);
+        parsedList = parseTaskApiContext(url);
+        parsedItem = parseTaskItemApiMeta(url);
+
+        if (parsedList) {
+          applyApiContext(parsedList);
           if (method === 'GET') {
             mergeApiRequestHeaders(extractFetchHeaders(input, init));
           }
+        }
+
+        if (parsedItem && method !== 'GET') {
+          mergeSaveRequestHeaders(extractFetchHeaders(input, init));
+          saveMethodHint = method;
         }
       }
 
       const responsePromise = originalFetch.call(this, input, init);
 
-      if (parsed && method === 'GET') {
+      if (parsedList && method === 'GET') {
         responsePromise
           .then(function (response) {
             if (!response || !response.ok) return;
             return response.clone().json().then(function (payload) {
-              ingestTasksPayload(payload, parsed.contextKey);
+              ingestTasksPayload(payload, parsedList.contextKey);
+            }).catch(function () {
+              return null;
+            });
+          })
+          .catch(function () {
+            return null;
+          });
+      }
+
+      if (parsedItem && method !== 'GET') {
+        responsePromise
+          .then(function (response) {
+            if (!response || !response.ok) return;
+            return response.clone().json().then(function (payload) {
+              ingestTaskItemPayload(payload, parsedItem);
             }).catch(function () {
               return null;
             });
@@ -303,9 +335,14 @@
     window.XMLHttpRequest.prototype.open = function (method, url) {
       this.__gctiMethod = String(method || 'GET').toUpperCase();
       this.__gctiApiMeta = typeof url === 'string' ? parseTaskApiContext(url) : null;
+      this.__gctiItemMeta = typeof url === 'string' ? parseTaskItemApiMeta(url) : null;
 
       if (this.__gctiApiMeta) {
         applyApiContext(this.__gctiApiMeta);
+      }
+
+      if (this.__gctiItemMeta && this.__gctiMethod !== 'GET') {
+        saveMethodHint = this.__gctiMethod;
       }
 
       return originalOpen.apply(this, arguments);
@@ -316,6 +353,13 @@
         const key = name.toLowerCase();
         if (isReplaySafeHeader(key)) {
           apiRequestHeaders[key] = String(value || '');
+        }
+      }
+
+      if (this.__gctiItemMeta && this.__gctiMethod !== 'GET' && typeof name === 'string') {
+        const key = name.toLowerCase();
+        if (isReplaySafeHeader(key)) {
+          saveRequestHeaders[key] = String(value || '');
         }
       }
 
@@ -335,6 +379,24 @@
           try {
             const payload = JSON.parse(body);
             ingestTasksPayload(payload, meta.contextKey);
+          } catch (error) {
+            return;
+          }
+        });
+      }
+
+      if (this.__gctiItemMeta && this.__gctiMethod !== 'GET') {
+        const itemMeta = this.__gctiItemMeta;
+        this.addEventListener('loadend', function () {
+          if (this.status < 200 || this.status >= 300) return;
+          const body = this.responseType === '' || this.responseType === 'text'
+            ? this.responseText
+            : null;
+          if (!body) return;
+
+          try {
+            const payload = JSON.parse(body);
+            ingestTaskItemPayload(payload, itemMeta);
           } catch (error) {
             return;
           }
@@ -368,6 +430,8 @@
     tasksFetchInFlight = null;
     lastFetchError = null;
     apiRequestHeaders = {};
+    saveRequestHeaders = {};
+    saveMethodHint = 'PATCH';
   }
 
   function parseTaskApiContext(rawUrl) {
@@ -393,6 +457,24 @@
       customerId,
       endpointUrl: endpointUrl.toString(),
       contextKey: locationId + '|' + customerId,
+    };
+  }
+
+  function parseTaskItemApiMeta(rawUrl) {
+    let url;
+    try {
+      url = new URL(rawUrl, window.location.origin);
+    } catch (error) {
+      return null;
+    }
+
+    const pathMatch = url.pathname.match(TASK_ITEM_PATH_RE);
+    if (!pathMatch) return null;
+
+    return {
+      locationId: pathMatch[1],
+      taskId: pathMatch[2],
+      endpointUrl: url.origin + url.pathname,
     };
   }
 
@@ -634,8 +716,9 @@
     }
   }
 
-  function saveFromModal() {
+  async function saveFromModal() {
     if (!activeCtx) return;
+    const ctx = activeCtx;
 
     clearValidation();
 
@@ -654,16 +737,31 @@
     }
     if (invalid) return;
 
-    const existing = localOverrides.get(activeCtx.key) || {};
-    const updated = {
+    setModalSaving(true);
+
+    const result = await saveTaskEdit(ctx, {
+      title,
+      notes,
+      dueDateIso: dueDate,
+    });
+
+    setModalSaving(false);
+
+    if (!result.ok) {
+      toast(result.message || LABELS.saveFailed);
+      return;
+    }
+
+    const finalTask = reconcileTaskAfterSave(ctx.taskId, result.task);
+    const updated = mapApiTaskToModalData(finalTask, {
       title,
       notes,
       dueDate,
-      taskType: existing.taskType || activeCtx.parts.taskType || 'Zadanie - Do zrobienia',
-    };
+      taskType: ctx.parts.taskType || 'Zadanie - Do zrobienia',
+    });
 
-    localOverrides.set(activeCtx.key, updated);
-    applyToCard(activeCtx.card, updated, activeCtx.parts);
+    localOverrides.set(ctx.key, updated);
+    applyToCard(ctx.card, updated, ctx.parts);
 
     closeModal();
     toast(LABELS.saved);
@@ -685,6 +783,134 @@
         parts.dueNode.textContent = display;
       }
     }
+  }
+
+  function setModalSaving(isSaving) {
+    if (modalSaveBtn) {
+      modalSaveBtn.disabled = Boolean(isSaving);
+      modalSaveBtn.textContent = isSaving ? LABELS.saving : LABELS.save;
+    }
+    if (modalCancelBtn) modalCancelBtn.disabled = Boolean(isSaving);
+  }
+
+  async function saveTaskEdit(ctx, formData) {
+    if (!ctx || !ctx.taskId || !apiContext || !apiContext.locationId) {
+      return { ok: false, message: LABELS.saveUnavailable };
+    }
+
+    const currentTaskResult = await getApiTaskById(ctx.taskId);
+    const currentTask = currentTaskResult.task || tasksById.get(ctx.taskId) || null;
+    if (!currentTask) {
+      return { ok: false, message: LABELS.saveUnavailable };
+    }
+
+    const payload = buildPatchPayload(currentTask, formData);
+    if (!payload) {
+      return { ok: false, message: LABELS.saveFailed };
+    }
+
+    const endpoint = buildTaskItemEndpoint(apiContext.locationId, ctx.taskId);
+    const method = isSupportedSaveMethod(saveMethodHint) ? saveMethodHint : 'PATCH';
+
+    try {
+      const response = await window.fetch(endpoint, {
+        method: method,
+        credentials: 'include',
+        headers: buildSaveHeaders(),
+        body: JSON.stringify(payload),
+      });
+
+      let body = null;
+      try {
+        body = await response.clone().json();
+      } catch (error) {
+        body = null;
+      }
+
+      if (!response.ok) {
+        const errorCode = body && body.code ? String(body.code) : '';
+        const errorMessage = body && body.message ? String(body.message) : '';
+        if (response.status === 403 || errorCode === 'NOT_AUTHORIZED') {
+          return { ok: false, message: LABELS.saveUnauthorized, status: response.status, code: errorCode };
+        }
+        return { ok: false, message: errorMessage || LABELS.saveFailed, status: response.status, code: errorCode };
+      }
+
+      const serverTask = normalizeSavedTask(body, currentTask, ctx.taskId);
+      ingestTaskItemPayload(serverTask, {
+        locationId: apiContext.locationId,
+        taskId: ctx.taskId,
+      });
+
+      return { ok: true, task: serverTask };
+    } catch (error) {
+      return { ok: false, message: LABELS.saveFailed };
+    }
+  }
+
+  function buildPatchPayload(apiTask, formData) {
+    const dueDateUnix = isoToUnixSeconds(formData.dueDateIso);
+    if (!dueDateUnix) return null;
+
+    const customer = apiTask.customer || {};
+    const customerId = apiContext && apiContext.customerId
+      ? apiContext.customerId
+      : (customer.original_user_id || apiTask.original_customer_id || '');
+    const firstName = customer.first_name || '';
+    const lastName = customer.last_name || '';
+
+    if (!customerId) return null;
+
+    return {
+      name: formData.title,
+      type: apiTask.type || 'To-Do',
+      notes: formData.notes,
+      due_date: dueDateUnix,
+      customer_id: customerId,
+      customer_first_name: firstName,
+      customer_last_name: lastName,
+      staff_id: null,
+    };
+  }
+
+  function buildTaskItemEndpoint(locationId, taskId) {
+    return window.location.origin + '/task-management-api/v1/locations/' + encodeURIComponent(locationId) + '/tasks/' + encodeURIComponent(taskId);
+  }
+
+  function buildSaveHeaders() {
+    const headers = buildReplayHeaders();
+    headers['content-type'] = 'application/json';
+    Object.keys(saveRequestHeaders || {}).forEach(function (key) {
+      if (isReplaySafeHeader(key) && saveRequestHeaders[key]) {
+        headers[key] = saveRequestHeaders[key];
+      }
+    });
+    return headers;
+  }
+
+  function isSupportedSaveMethod(method) {
+    const normalized = String(method || '').toUpperCase();
+    return normalized === 'PATCH' || normalized === 'PUT';
+  }
+
+  function reconcileTaskAfterSave(taskId, serverTask) {
+    if (!taskId) return serverTask || {};
+    const previous = tasksById.get(taskId) || {};
+    const next = normalizeSavedTask(serverTask, previous, taskId);
+    tasksById.set(taskId, next);
+    return next;
+  }
+
+  function normalizeSavedTask(serverTask, baseTask, taskId) {
+    const base = baseTask || {};
+    const payload = serverTask || {};
+    const normalizedId = payload._id || taskId || base._id || '';
+
+    return Object.assign({}, base, payload, {
+      _id: normalizedId,
+      original_customer_id: payload.original_customer_id || base.original_customer_id || (apiContext && apiContext.customerId) || '',
+      customer: Object.assign({}, base.customer || {}, payload.customer || {}),
+    });
   }
 
   function clearValidation() {
@@ -756,6 +982,19 @@
     return yyyy + '-' + mm + '-' + dd;
   }
 
+  function isoToUnixSeconds(isoDate) {
+    if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return 0;
+
+    const parts = isoDate.split('-');
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10);
+    const day = parseInt(parts[2], 10);
+    if (!year || !month || !day) return 0;
+
+    // API operuje na timestampie z końca dnia (23:59:59 UTC) dla wybranego terminu.
+    return Math.floor(Date.UTC(year, month - 1, day, 23, 59, 59) / 1000);
+  }
+
   function normalize(value) {
     return String(value || '').replace(/\s+/g, ' ').trim();
   }
@@ -805,6 +1044,14 @@
     });
   }
 
+  function mergeSaveRequestHeaders(nextHeaders) {
+    Object.keys(nextHeaders || {}).forEach(function (key) {
+      if (isReplaySafeHeader(key)) {
+        saveRequestHeaders[key.toLowerCase()] = String(nextHeaders[key] || '');
+      }
+    });
+  }
+
   function buildReplayHeaders() {
     const headers = { accept: 'application/json' };
     Object.keys(apiRequestHeaders || {}).forEach(function (key) {
@@ -838,6 +1085,15 @@
       tasksById = next;
       lastFetchError = null;
     }
+  }
+
+  function ingestTaskItemPayload(payload, meta) {
+    if (!payload || typeof payload !== 'object') return;
+    if (!meta || !meta.taskId || !meta.locationId) return;
+    if (!apiContext || apiContext.locationId !== meta.locationId) return;
+
+    const normalized = normalizeSavedTask(payload, tasksById.get(meta.taskId), meta.taskId);
+    tasksById.set(meta.taskId, normalized);
   }
 
   if (document.readyState === 'loading') {
