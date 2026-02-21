@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Glofox Client Tasks - Inline Manager (Stable)
 // @namespace    https://glofox.com/
-// @version      1.2.0
-// @description  Dodaje przycisk Edytuj na kafelkach zadań klienta i otwiera modal do edycji (realny odczyt + realny zapis)
+// @version      1.3.0
+// @description  Dodaje Edytuj i Zrobione na kafelkach zadań klienta (realny odczyt + realny zapis + completion)
 // @author       You
 // @match        *://*.glofox.com/*
 // @run-at       document-idle
@@ -22,6 +22,7 @@
 
   const LABELS = {
     edit: 'Edytuj',
+    done: 'Zrobione',
     modalTitle: 'Edytuj zadanie',
     name: 'Nazwa zadania',
     notes: 'Notatka (uwagi zadania)',
@@ -33,6 +34,13 @@
     saveFailed: 'Nie udało się zapisać zadania',
     saveUnauthorized: 'Brak autoryzacji do zapisu zadania',
     saveUnavailable: 'Brak kontekstu API do zapisu',
+    doneSuccess: 'Zadanie oznaczone jako zrobione.',
+    doneFailed: 'Oznaczenie jako zrobione nie powiodlo sie.',
+    doneUnauthorized: 'Brak autoryzacji (401/403). Odswiez sesje i sprobuj ponownie.',
+    doneConfirmTitle: 'Potwierdzenie oznaczenia',
+    doneConfirmText: 'Czy na pewno chcesz oznaczyc to zadanie jako zrobione?',
+    doneConfirmAction: 'Tak, oznacz jako zrobione',
+    doneConfirmBusy: 'Oznaczanie...',
     fallbackDom: 'Użyto danych lokalnych (brak rekordu API)',
   };
 
@@ -61,6 +69,12 @@
   let modalSaveBtn;
   let activeCtx = null;
   let restoreFocusEl = null;
+  let doneConfirmOverlay = null;
+  let doneConfirmError = null;
+  let doneConfirmCancelBtn = null;
+  let doneConfirmSubmitBtn = null;
+  let doneConfirmCtx = null;
+  let doneInFlight = false;
 
   let apiContext = null;
   let tasksById = new Map();
@@ -96,6 +110,7 @@
     style.id = 'gcti-style';
     style.textContent = `
       .gcti-edit-btn-wrap { margin-top: 8px; }
+      .gcti-actions-stack { display: flex; gap: 8px; flex-wrap: wrap; }
       .gcti-edit-btn {
         border: 1px solid #4a3fcf;
         color: #4a3fcf;
@@ -107,6 +122,18 @@
         cursor: pointer;
       }
       .gcti-edit-btn:hover { background: #f3f2ff; }
+      .gcti-done-btn {
+        border: 1px solid #1e7d3f;
+        background: #1e7d3f;
+        color: #fff;
+        border-radius: 8px;
+        padding: 6px 10px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .gcti-done-btn:hover { filter: brightness(0.95); }
+      .gcti-done-btn:disabled { opacity: 0.55; cursor: not-allowed; filter: none; }
 
       .gcti-overlay {
         position: fixed;
@@ -256,6 +283,48 @@
         font-size: 12px;
         color: #b4233f;
       }
+
+      .gcti-confirm-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(6, 10, 20, 0.5);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 20px;
+        z-index: 1000002;
+      }
+      .gcti-confirm-overlay.gcti-open { display: flex; }
+      .gcti-confirm-modal {
+        width: min(520px, 94vw);
+        background: #fff;
+        border-radius: 12px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+        padding: 16px;
+      }
+      .gcti-confirm-title {
+        font-size: 16px;
+        font-weight: 700;
+        color: #202442;
+      }
+      .gcti-confirm-text {
+        margin-top: 8px;
+        font-size: 13px;
+        color: #40466f;
+        line-height: 1.4;
+      }
+      .gcti-confirm-error {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #b4233f;
+        display: none;
+      }
+      .gcti-confirm-actions {
+        margin-top: 14px;
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
     `;
 
     document.head.appendChild(style);
@@ -327,6 +396,7 @@
     overlay.appendChild(modal);
     document.body.appendChild(overlay);
     ensureCalendarPopup();
+    ensureDoneConfirmModal();
 
     overlay.addEventListener('click', function (event) {
       if (event.target === overlay) closeModal();
@@ -337,6 +407,10 @@
     document.addEventListener('keydown', function (event) {
       if (event.key === 'Escape' && calendarState.open) {
         closeCalendar();
+        return;
+      }
+      if (event.key === 'Escape' && doneConfirmOverlay && doneConfirmOverlay.classList.contains('gcti-open')) {
+        closeDoneConfirm();
         return;
       }
       if (event.key === 'Escape' && overlay.classList.contains('gcti-open')) closeModal();
@@ -421,6 +495,287 @@
     });
     calendarPopupEl.addEventListener('click', onCalendarClick);
     document.body.appendChild(calendarPopupEl);
+  }
+
+  function ensureDoneConfirmModal() {
+    if (doneConfirmOverlay) return;
+
+    doneConfirmOverlay = document.createElement('div');
+    doneConfirmOverlay.className = 'gcti-confirm-overlay';
+
+    const modal = document.createElement('div');
+    modal.className = 'gcti-confirm-modal';
+
+    const title = document.createElement('div');
+    title.className = 'gcti-confirm-title';
+    title.textContent = LABELS.doneConfirmTitle;
+
+    const text = document.createElement('div');
+    text.className = 'gcti-confirm-text';
+    text.textContent = LABELS.doneConfirmText;
+
+    doneConfirmError = document.createElement('div');
+    doneConfirmError.className = 'gcti-confirm-error';
+
+    const actions = document.createElement('div');
+    actions.className = 'gcti-confirm-actions';
+
+    doneConfirmCancelBtn = document.createElement('button');
+    doneConfirmCancelBtn.type = 'button';
+    doneConfirmCancelBtn.className = 'gcti-btn';
+    doneConfirmCancelBtn.textContent = LABELS.cancel;
+
+    doneConfirmSubmitBtn = document.createElement('button');
+    doneConfirmSubmitBtn.type = 'button';
+    doneConfirmSubmitBtn.className = 'gcti-btn gcti-done-btn';
+    doneConfirmSubmitBtn.textContent = LABELS.doneConfirmAction;
+
+    actions.appendChild(doneConfirmCancelBtn);
+    actions.appendChild(doneConfirmSubmitBtn);
+
+    modal.appendChild(title);
+    modal.appendChild(text);
+    modal.appendChild(doneConfirmError);
+    modal.appendChild(actions);
+    doneConfirmOverlay.appendChild(modal);
+    document.body.appendChild(doneConfirmOverlay);
+
+    doneConfirmOverlay.addEventListener('click', function (event) {
+      if (event.target === doneConfirmOverlay) closeDoneConfirm();
+    });
+    doneConfirmCancelBtn.addEventListener('click', closeDoneConfirm);
+    doneConfirmSubmitBtn.addEventListener('click', confirmDone);
+  }
+
+  function openDoneConfirm(ctx) {
+    if (!ctx || !ctx.taskId) return;
+    doneConfirmCtx = ctx;
+    if (doneConfirmError) {
+      doneConfirmError.textContent = '';
+      doneConfirmError.style.display = 'none';
+    }
+    doneInFlight = false;
+    updateDoneConfirmUi();
+    doneConfirmOverlay.classList.add('gcti-open');
+  }
+
+  function closeDoneConfirm() {
+    if (doneInFlight) return;
+    if (doneConfirmOverlay) doneConfirmOverlay.classList.remove('gcti-open');
+    doneConfirmCtx = null;
+    if (doneConfirmError) {
+      doneConfirmError.textContent = '';
+      doneConfirmError.style.display = 'none';
+    }
+    updateDoneButtonState(null, false);
+  }
+
+  async function confirmDone() {
+    if (!doneConfirmCtx || doneInFlight) return;
+
+    doneInFlight = true;
+    updateDoneConfirmUi();
+    updateDoneButtonState(doneConfirmCtx.card, true);
+
+    const result = await executeCompletionRequest(doneConfirmCtx);
+
+    if (!result.ok) {
+      doneInFlight = false;
+      if (doneConfirmError) {
+        doneConfirmError.textContent = result.message || LABELS.doneFailed;
+        doneConfirmError.style.display = 'block';
+      }
+      updateDoneConfirmUi();
+      updateDoneButtonState(doneConfirmCtx.card, false);
+      return;
+    }
+
+    removeTaskFromUi(doneConfirmCtx);
+    doneInFlight = false;
+    closeDoneConfirm();
+    toast(LABELS.doneSuccess);
+  }
+
+  async function executeCompletionRequest(ctx) {
+    if (!ctx || !ctx.taskId || !apiContext || !apiContext.locationId) {
+      return { ok: false, message: LABELS.saveUnavailable };
+    }
+
+    const userId = deriveCurrentUserId();
+    const completionDate = Math.floor(Date.now() / 1000);
+    const endpoint = window.location.origin
+      + '/task-management-api/v1/locations/'
+      + encodeURIComponent(apiContext.locationId)
+      + '/tasks/'
+      + encodeURIComponent(ctx.taskId)
+      + '/completion';
+
+    const payload = {
+      _id: ctx.taskId,
+      location_id: apiContext.locationId,
+      completion_date: completionDate,
+      completed_by: userId,
+    };
+
+    try {
+      const response = await window.fetch(endpoint, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: buildSaveHeaders(),
+        body: JSON.stringify(payload),
+      });
+
+      let body = null;
+      try {
+        body = await response.clone().json();
+      } catch (error) {
+        body = null;
+      }
+
+      if (!response.ok) {
+        const code = body && body.code ? String(body.code) : '';
+        const message = body && body.message ? String(body.message) : '';
+        if (response.status === 401 || response.status === 403 || code === 'NOT_AUTHORIZED') {
+          return { ok: false, message: LABELS.doneUnauthorized };
+        }
+        return { ok: false, message: message || LABELS.doneFailed };
+      }
+
+      return { ok: true, data: body };
+    } catch (error) {
+      return { ok: false, message: LABELS.doneFailed };
+    }
+  }
+
+  function removeTaskFromUi(ctx) {
+    if (!ctx) return;
+    if (ctx.key) localOverrides.delete(ctx.key);
+    if (ctx.taskId) tasksById.delete(ctx.taskId);
+    if (activeCtx && activeCtx.taskId && ctx.taskId && activeCtx.taskId === ctx.taskId) {
+      closeModal();
+    }
+    if (ctx.card && ctx.card.parentElement) ctx.card.remove();
+  }
+
+  function updateDoneConfirmUi() {
+    if (!doneConfirmSubmitBtn || !doneConfirmCancelBtn) return;
+    doneConfirmSubmitBtn.disabled = Boolean(doneInFlight);
+    doneConfirmCancelBtn.disabled = Boolean(doneInFlight);
+    doneConfirmSubmitBtn.textContent = doneInFlight ? LABELS.doneConfirmBusy : LABELS.doneConfirmAction;
+  }
+
+  function updateDoneButtonState(card, busy) {
+    const target = card && card.querySelector ? card.querySelector('.gcti-done-btn') : null;
+    if (!target) return;
+    target.disabled = Boolean(busy);
+  }
+
+  function deriveCurrentUserId() {
+    const fromToken = extractUserIdFromAuthHeaders();
+    if (fromToken) return fromToken;
+    const fromStorage = extractUserIdFromStorage();
+    if (fromStorage) return fromStorage;
+    return '';
+  }
+
+  function extractUserIdFromAuthHeaders() {
+    const bearer = readBearerFromHeaders(saveRequestHeaders) || readBearerFromHeaders(apiRequestHeaders);
+    if (!bearer) return '';
+    const parts = bearer.split('.');
+    if (parts.length < 2) return '';
+    const payload = safeDecodeBase64Url(parts[1]);
+    if (!payload) return '';
+    const obj = safeJson(payload);
+    if (!obj || typeof obj !== 'object') return '';
+    const candidates = [obj.sub, obj.user_id, obj.userId, obj.uid, obj.id];
+    for (const id of candidates) {
+      const value = String(id || '').trim();
+      if (value) return value;
+    }
+    return '';
+  }
+
+  function readBearerFromHeaders(source) {
+    const auth = source && source.authorization ? String(source.authorization) : '';
+    const match = auth.match(/^Bearer\s+(.+)$/i);
+    return match ? match[1].trim() : '';
+  }
+
+  function safeDecodeBase64Url(value) {
+    try {
+      const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+      const remainder = normalized.length % 4;
+      const padded = remainder ? normalized + '='.repeat(4 - remainder) : normalized;
+      return atob(padded);
+    } catch (error) {
+      return '';
+    }
+  }
+
+  function extractUserIdFromStorage() {
+    const stores = [window.localStorage, window.sessionStorage];
+    for (const store of stores) {
+      const id = extractUserIdFromSingleStorage(store);
+      if (id) return id;
+    }
+    return '';
+  }
+
+  function extractUserIdFromSingleStorage(store) {
+    if (!store) return '';
+    for (let i = 0; i < store.length; i += 1) {
+      const key = store.key(i);
+      if (!key) continue;
+      if (!/user|auth|token|profile|session/i.test(key)) continue;
+      const raw = store.getItem(key);
+      if (!raw) continue;
+      const id = extractUserIdFromUnknownPayload(raw);
+      if (id) return id;
+    }
+    return '';
+  }
+
+  function extractUserIdFromUnknownPayload(raw) {
+    if (!raw) return '';
+    const directJson = safeJson(raw);
+    const fromJson = directJson ? findUserIdInObject(directJson) : '';
+    if (fromJson) return fromJson;
+    const jwtMatch = String(raw).match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+    if (jwtMatch) {
+      const parts = jwtMatch[0].split('.');
+      const decoded = safeDecodeBase64Url(parts[1]);
+      const payload = safeJson(decoded);
+      const id = payload ? findUserIdInObject(payload) : '';
+      if (id) return id;
+    }
+    return '';
+  }
+
+  function findUserIdInObject(obj) {
+    if (!obj || typeof obj !== 'object') return '';
+    const keys = ['userId', 'user_id', 'uid', 'sub', 'id', 'original_user_id'];
+    for (const key of keys) {
+      if (obj[key]) {
+        const value = String(obj[key]).trim();
+        if (value) return value;
+      }
+    }
+    for (const nestedKey of Object.keys(obj)) {
+      const nested = obj[nestedKey];
+      if (nested && typeof nested === 'object') {
+        const nestedFound = findUserIdInObject(nested);
+        if (nestedFound) return nestedFound;
+      }
+    }
+    return '';
+  }
+
+  function safeJson(raw) {
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      return null;
+    }
   }
 
   function onCalendarClick(event) {
@@ -957,6 +1312,8 @@
 
     const wrap = document.createElement('div');
     wrap.className = 'gcti-edit-btn-wrap';
+    const actionsStack = document.createElement('div');
+    actionsStack.className = 'gcti-actions-stack';
 
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -981,7 +1338,22 @@
       }
     });
 
-    wrap.appendChild(btn);
+    const doneBtn = document.createElement('button');
+    doneBtn.type = 'button';
+    doneBtn.className = 'gcti-done-btn';
+    doneBtn.textContent = LABELS.done;
+    doneBtn.disabled = !taskId;
+    doneBtn.addEventListener('click', function () {
+      openDoneConfirm({
+        key,
+        taskId,
+        card,
+      });
+    });
+
+    actionsStack.appendChild(btn);
+    actionsStack.appendChild(doneBtn);
+    wrap.appendChild(actionsStack);
     const body = card.querySelector('.ant-card-body') || card;
     body.appendChild(wrap);
   }
