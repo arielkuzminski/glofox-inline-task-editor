@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Glofox Client Tasks - Inline Manager (Stable)
 // @namespace    https://glofox.com/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Dodaje Edytuj i Zrobione na kafelkach zadań klienta (realny odczyt + realny zapis + completion)
 // @author       You
 // @match        *://*.glofox.com/*
