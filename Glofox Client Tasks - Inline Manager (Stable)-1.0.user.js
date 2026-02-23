@@ -47,6 +47,7 @@
   const TASKS_PATH_RE = /^\/task-management-api\/v1\/locations\/([^/]+)\/tasks$/i;
   const TASK_ITEM_PATH_RE = /^\/task-management-api\/v1\/locations\/([^/]+)\/tasks\/([^/?#]+)$/i;
   const TASKS_TEST_ID_PREFIX = 'tasks-member-list-element-';
+  const TASK_DUE_TIMEZONE = 'Europe/Warsaw';
   const CALENDAR_MONTH_NAMES_PL = ['styczen', 'luty', 'marzec', 'kwiecien', 'maj', 'czerwiec', 'lipiec', 'sierpien', 'wrzesien', 'pazdziernik', 'listopad', 'grudzien'];
   const CALENDAR_DAY_NAMES_PL = ['Pon', 'Wt', 'Sr', 'Czw', 'Pt', 'Sob', 'Nie'];
 
@@ -1847,13 +1848,9 @@
 
   function unixSecondsToIso(value) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '';
-    const date = new Date(value * 1000);
-
-    const yyyy = String(date.getUTCFullYear());
-    const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
-    const dd = String(date.getUTCDate()).padStart(2, '0');
-
-    return yyyy + '-' + mm + '-' + dd;
+    const parts = formatDatePartsInZone(value * 1000, TASK_DUE_TIMEZONE);
+    if (!parts) return '';
+    return parts.year + '-' + parts.month + '-' + parts.day;
   }
 
   function isoToUnixSeconds(isoDate) {
@@ -1865,8 +1862,54 @@
     const day = parseInt(parts[2], 10);
     if (!year || !month || !day) return 0;
 
-    // API operuje na timestampie z końca dnia (23:59:59 UTC) dla wybranego terminu.
-    return Math.floor(Date.UTC(year, month - 1, day, 23, 59, 59) / 1000);
+    // due_date mapujemy na 23:59:59 w strefie Europe/Warsaw, aby uniknac przesuniecia dnia w UI Glofox.
+    const utcWallTime = Date.UTC(year, month - 1, day, 23, 59, 59);
+    const offsetMs = getTimeZoneOffsetMs(utcWallTime, TASK_DUE_TIMEZONE);
+    if (!Number.isFinite(offsetMs)) return 0;
+    return Math.floor((utcWallTime - offsetMs) / 1000);
+  }
+
+  function formatDatePartsInZone(timestampMs, timeZone) {
+    try {
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      });
+      const parts = formatter.formatToParts(new Date(timestampMs));
+      const year = (parts.find(function (p) { return p.type === 'year'; }) || {}).value || '';
+      const month = (parts.find(function (p) { return p.type === 'month'; }) || {}).value || '';
+      const day = (parts.find(function (p) { return p.type === 'day'; }) || {}).value || '';
+      if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !/^\d{2}$/.test(day)) return null;
+      return { year: year, month: month, day: day };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function getTimeZoneOffsetMs(timestampMs, timeZone) {
+    try {
+      const formatter = new Intl.DateTimeFormat('en-US', {
+        timeZone: timeZone,
+        timeZoneName: 'shortOffset',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+      const parts = formatter.formatToParts(new Date(timestampMs));
+      const zonePart = (parts.find(function (p) { return p.type === 'timeZoneName'; }) || {}).value || '';
+      const match = zonePart.match(/^GMT([+-])(\d{1,2})(?::(\d{2}))?$/i);
+      if (!match) return NaN;
+      const sign = match[1] === '-' ? -1 : 1;
+      const hours = parseInt(match[2], 10);
+      const minutes = parseInt(match[3] || '0', 10);
+      if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return NaN;
+      return sign * ((hours * 60 + minutes) * 60 * 1000);
+    } catch (error) {
+      return NaN;
+    }
   }
 
   function normalize(value) {
